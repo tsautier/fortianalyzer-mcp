@@ -167,9 +167,10 @@ LOG_LEVEL=INFO  # DEBUG for troubleshooting
 # HTTP Authentication (optional, recommended for Docker/HTTP deployments)
 # MCP_AUTH_TOKEN=your-secret-token
 
-# Allowed Host headers for reverse proxy deployments (optional)
-# Required when running behind a reverse proxy (e.g., Traefik, nginx).
+# Allowed Host headers for HTTP/Docker deployments (optional)
+# Set to the value clients use in their connection URL — NOT the client's IP.
 # The MCP SDK rejects non-localhost Host headers by default for DNS rebinding protection.
+# Examples: ["mcp.example.com"], ["10.1.5.62:8001"], or wildcard ["10.1.5.62:*"]
 # MCP_ALLOWED_HOSTS=["mcp.example.com"]
 ```
 
@@ -299,10 +300,15 @@ MCP Client → HTTPS → Reverse Proxy (Traefik/nginx) → HTTP → MCP Containe
 
 **Key considerations:**
 
-1. **MCP_ALLOWED_HOSTS** — The MCP SDK validates Host headers to prevent DNS rebinding attacks. Behind a reverse proxy, the Host header is your external hostname (not `localhost`). You must configure allowed hosts:
+1. **MCP_ALLOWED_HOSTS** — The MCP SDK validates the Host header to prevent DNS rebinding attacks. By default only `localhost` and `127.0.0.1` are accepted. Set this to the value clients put in their connection URL (NOT the client's IP):
 
    ```bash
+   # Reverse-proxy hostname (Traefik/nginx):
    MCP_ALLOWED_HOSTS=["mcp.example.com"]
+   # Direct Docker exposure on IP+port:
+   MCP_ALLOWED_HOSTS=["10.1.5.62:8001"]
+   # Port wildcard (any port on the host):
+   MCP_ALLOWED_HOSTS=["10.1.5.62:*"]
    ```
 
 2. **MCP_AUTH_TOKEN** — Always set a Bearer token for HTTP deployments:
@@ -641,6 +647,52 @@ LOG_LEVEL=DEBUG fortianalyzer-mcp
 - Ensure the report layout exists (use `list_report_layouts`)
 - Verify the ADOM has the required data for the report
 - Check FortiAnalyzer has sufficient disk space
+
+### MCP Transport Issues
+
+**`Invalid Host header` (HTTP/Docker mode)**
+
+Symptom — server logs show:
+
+```
+mcp.server.transport_security - WARNING - Invalid Host header: 10.x.y.z:8001
+INFO:     ... "POST /mcp HTTP/1.1" 421 Misdirected Request
+```
+
+Cause: the MCP SDK validates the Host header for DNS rebinding protection. By default only `localhost` and `127.0.0.1` are accepted. The header value is whatever the **client** puts in its connection URL — not the client's IP.
+
+Fix: add the URL value (with port, if used) to `MCP_ALLOWED_HOSTS`:
+
+```bash
+# If the client connects to http://10.1.5.62:8001/mcp:
+MCP_ALLOWED_HOSTS=["10.1.5.62:8001"]
+# Or use a port wildcard to allow any port on that host:
+MCP_ALLOWED_HOSTS=["10.1.5.62:*"]
+# For a reverse-proxy hostname:
+MCP_ALLOWED_HOSTS=["mcp.example.com"]
+```
+
+**`PermissionError: pyvenv.cfg` (macOS stdio mode)**
+
+Symptom — Claude Desktop MCP logs show:
+
+```
+Fatal Python error: init_import_site: Failed to import the site module
+PermissionError: [Errno 1] Operation not permitted: '.../.venv/pyvenv.cfg'
+```
+
+Cause: macOS TCC (Transparency, Consent, Control) blocks Claude Desktop from launching executables from inside `~/Documents`, `~/Desktop`, or `~/Downloads`.
+
+Fix (preferred): move the project out of those folders, recreate the venv, and update Claude Desktop's MCP config to the new path:
+
+```bash
+mv ~/Documents/mcp ~/mcp
+cd ~/mcp/fortianalyzer-mcp
+rm -rf .venv && uv sync
+# Then update the "command" path in claude_desktop_config.json
+```
+
+Fix (alternative): grant Claude Desktop **Full Disk Access** — System Settings → Privacy & Security → Full Disk Access → add Claude. Broader permission; only use if relocation isn't feasible.
 
 ### Viewing Logs
 
