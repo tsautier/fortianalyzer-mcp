@@ -5,6 +5,20 @@ All notable changes to FortiAnalyzer MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1-beta] - 2026-05-17
+
+### Fixed
+- **Relative time-range queries no longer silently miss logs when client and FAZ have different system timezones** ([#13](https://github.com/rstierli/fortianalyzer-mcp/issues/13)). FAZ accepts naive `YYYY-MM-DD HH:MM:SS` timestamps and interprets them in its own system TZ. The MCP previously called `datetime.now()` (caller-local) and formatted naive, so when client and FAZ disagreed by N hours every relative window smaller than N silently returned zero logs. Discovered with a fresh FAZ 8.0.0 GA defaulting to US/Pacific while the client lived in CEST — `search_traffic_logs(time_range="1-hour")` was searching a window 9 hours in the future. The MCP now reads FAZ's IANA TZ from `get_system_status`, caches it on the client, and computes "now" in UTC → FAZ-local before formatting. Custom absolute ranges (`"start|end"`) skip the TZ lookup.
+- **Unknown `time_range` keys now raise `ValueError` instead of silently falling back to 1-hour or 24-hour.** Typos like `"30-min"` or `"5-min"` no longer produce wrong-but-plausible windows.
+
+### Added
+- **More relative-range presets supported uniformly across all tools:** `now / 5-min / 15-min / 30-min / 1-hour / 2-hour / 6-hour / 12-hour / 24-hour / 1-day / 2-day / 7-day / 30-day / 90-day`. Previously each of the 8 tool files supported a slightly different subset.
+- **FortiAnalyzer 8.0.x support** — tested against 8.0.0 GA (build 0105).
+- **`FortiAnalyzerClient.get_system_timezone()`** — public async method that returns the cached FAZ IANA timezone as a `zoneinfo.ZoneInfo`.
+
+### Changed
+- **Consolidated 8 duplicate `_parse_time_range` implementations** into a single `utils/time_range.py` (single source of truth). Each tool now uses a thin async wrapper that delegates to the shared utility with the FAZ-cached TZ.
+
 ## [1.2.0-beta] - 2026-04-24
 
 ### Changed
