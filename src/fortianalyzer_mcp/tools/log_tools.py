@@ -31,6 +31,190 @@ logger = logging.getLogger(__name__)
 DEFAULT_SEARCH_TIMEOUT = 60
 # Poll interval for search progress
 POLL_INTERVAL = 1.0
+# Appliance maximum for the logsearch fetch limit (rejects > 1000).
+LOG_FETCH_LIMIT_MAX = 1000
+
+
+# In-process registry of log-search context, keyed by a pagination handle.
+#
+# IMPORTANT (verified against the lab appliance): a FortiAnalyzer logsearch tid
+# is single-use -- the first fetch delivers the requested offset/limit slice and
+# the task is then reaped, so a second fetch on the same tid raises "Invalid
+# tid". Pagination therefore works by running a *fresh* search per page (results
+# are stably ordered across searches for a fixed time window). query_logs records
+# the search parameters here under a handle (the first page's tid value) so
+# fetch_more_logs can reconstruct and re-run the same query at a new offset
+# without the caller re-supplying ADOM/filter/time_range.
+#
+# This is ephemeral process state (not a persisted job-state file or queue) and
+# assumes the server runs as a single process (uvicorn with no workers), so the
+# global client and this registry are shared across requests.
+_SEARCH_REGISTRY: dict[int, dict[str, Any]] = {}
+
+# Cap the registry so a long-lived process cannot accumulate handles without
+# bound; evict the oldest handle past the cap (FIFO, dict is insertion-ordered).
+_SEARCH_REGISTRY_MAX = 512
+
+
+def _register_search(tid: int, context: dict[str, Any]) -> None:
+    """Record the search context for a pagination handle (bounded, FIFO)."""
+    _SEARCH_REGISTRY[tid] = context
+    while len(_SEARCH_REGISTRY) > _SEARCH_REGISTRY_MAX:
+        oldest = next(iter(_SEARCH_REGISTRY))
+        del _SEARCH_REGISTRY[oldest]
+
+
+def _get_search_context(tid: int) -> dict[str, Any] | None:
+    """Return the stored search context for a tid, if known to this process."""
+    return _SEARCH_REGISTRY.get(tid)
+
+
+def _unregister_search(tid: int) -> None:
+    """Drop a tid from the registry (after cancel or expiry)."""
+    _SEARCH_REGISTRY.pop(tid, None)
+
+
+def _is_invalid_tid_error(exc: Exception) -> bool:
+    """Heuristically detect a FortiAnalyzer 'invalid/expired tid' error.
+
+    FAZ surfaces an expired or unknown log-search task as an error mentioning the
+    tid. We classify by message because the exact error code varies by version;
+    this is verified/tightened against the live appliance.
+    """
+    msg = str(exc).lower()
+    if "tid" not in msg:
+        return False
+    return any(
+        marker in msg
+        for marker in ("invalid", "not found", "no such", "expired", "unknown", "does not exist")
+    )
+
+
+def _tid_error_response(tid: int, adom: str, detail: object) -> dict[str, Any]:
+    """Build a structured error response for an invalid/expired tid/handle."""
+    return {
+        "status": "error",
+        "error_type": "tid_invalid_or_expired",
+        "tid": tid,
+        "adom": adom,
+        "message": (
+            f"Search handle {tid} is no longer valid on FortiAnalyzer "
+            f"(adom={adom}). It may have expired or been cancelled. Detail: {detail}"
+        ),
+        "recommendation": "Re-run query_logs to start a new search and obtain a fresh tid.",
+    }
+
+
+def _clamp_limit(limit: int) -> int:
+    """Clamp a caller-supplied limit to the appliance-accepted range [1, 1000].
+
+    FortiAnalyzer rejects ``limit > 1000`` for the logsearch fetch endpoint, and
+    an unbounded limit would also let a caller pull an arbitrarily large raw-log
+    slice into the response. Non-int/negative values fall back to the default.
+    """
+    if not isinstance(limit, int) or isinstance(limit, bool):
+        return 100
+    return max(1, min(limit, LOG_FETCH_LIMIT_MAX))
+
+
+def _compute_has_more(offset: int, count: int, limit: int, total: int | None) -> bool:
+    """Decide whether more results remain beyond the current page.
+
+    When the total is known, compare against the consumed range. When it is
+    unknown, fall back to the full-page heuristic: a page filled to the limit
+    implies more rows may exist.
+    """
+    if total is not None:
+        return (offset + count) < total
+    return limit > 0 and count >= limit
+
+
+def _coerce_total(value: Any) -> int | None:
+    """Coerce a FAZ ``total-count`` value to int, or None if unavailable."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
+
+
+async def _run_search_page(
+    client: Any,
+    *,
+    adom: str,
+    logtype: str,
+    device_filter: list[dict[str, str]],
+    time_range: dict[str, str],
+    filter: str | None,
+    offset: int,
+    limit: int,
+    timeout: int,
+) -> dict[str, Any]:
+    """Run one self-contained search page: start, fetch, return the page.
+
+    Each page is its own search because a FAZ logsearch tid is single-use: the
+    first fetch delivers the slice plus ``total-count`` and the task is reaped.
+    The fetch blocks server-side until the search completes, so it usually
+    returns ``percentage>=100`` on the first try. If it returns incomplete, or
+    the task was reaped before our fetch, the search is re-issued from scratch.
+    Re-issues are bounded by the wall-clock ``timeout`` (not a fixed attempt
+    count), so the caller's timeout budget is honored; on expiry the page is
+    returned as ``timed_out`` rather than raising a raw appliance error.
+
+    Returns ``{"timed_out": bool, "tid": int, "logs": list, "total": int|None}``.
+    """
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    tid: int | None = None
+
+    while True:
+        start_result = await client.logsearch_start(
+            adom=adom,
+            logtype=logtype,
+            device=device_filter,
+            time_range=time_range,
+            filter=filter,
+            limit=limit,
+            offset=offset,
+        )
+        tid = start_result.get("tid")
+        if not tid:
+            raise RuntimeError(f"Failed to start search: no TID returned. Response: {start_result}")
+
+        fetch_result: dict[str, Any] | None
+        try:
+            fetch_result = await client.logsearch_fetch(
+                adom=adom, tid=tid, limit=limit, offset=offset
+            )
+        except Exception as exc:
+            # Task reaped before our fetch -> re-issue (bounded by deadline).
+            if not _is_invalid_tid_error(exc):
+                raise
+            fetch_result = None
+
+        if fetch_result is not None and fetch_result.get("percentage", 0) >= 100:
+            logs = fetch_result.get("data", [])
+            if not isinstance(logs, list):
+                logs = [logs] if logs else []
+            return {
+                "timed_out": False,
+                "tid": tid,
+                "logs": logs,
+                "total": _coerce_total(fetch_result.get("total-count")),
+            }
+
+        # Incomplete (the single-use task is now reaped) or reaped before fetch:
+        # re-issue a fresh search until the timeout budget is exhausted.
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            try:
+                await client.logsearch_cancel(adom, tid)
+            except Exception:
+                pass
+            return {"timed_out": True, "tid": tid, "logs": [], "total": None}
+        await asyncio.sleep(min(POLL_INTERVAL, remaining))
 
 
 def _get_client():
@@ -140,12 +324,25 @@ async def query_logs(
     Returns:
         dict: Log query results with keys:
             - status: "success" or "error"
-            - count: Number of logs returned
-            - total: Total logs matching query
-            - percentage: Search completion percentage
-            - logs: List of log entries
-            - tid: Task ID (for pagination)
+            - count: Number of logs returned in this page
+            - total: Total logs matching the query (int), or None if unknown
+            - total_known: Whether `total` is authoritative (False => unknown/capped)
+            - percentage: Search completion percentage (100 on success)
+            - tid: Reusable pagination handle (pass to fetch_more_logs)
+            - has_more: Whether more results remain beyond this page
+            - logs: List of log entries (bounded by `limit`)
+            - adom, logtype, filter, device: Echoed query context (auditability)
+            - time_range: Resolved {start, end} bounds actually sent to FAZ
+            - timezone: FAZ system timezone the timestamps are interpreted in
+            - time_basis: Human note clarifying timestamps are FAZ local time
+            - returned_offset, returned_limit: Paging echoes
             - message: Error message if failed
+
+    Note on pagination: a FortiAnalyzer logsearch task id is single-use (it is
+    reaped after the first fetch). The `tid` returned here is a reusable handle
+    backed by an in-process record of the search parameters; fetch_more_logs
+    re-runs the same query at a new offset. For a fixed time window the result
+    order is stable, so paging is consistent.
 
     Example:
         >>> # Get last hour of traffic logs
@@ -165,79 +362,91 @@ async def query_logs(
         logtype = validate_log_type(logtype)
 
         client = _get_client()
+        await client.ensure_connected()
 
-        # Parse time range
-        time_range_dict = await _parse_time_range(time_range)
+        # Resolve the FAZ system timezone once: used both to align relative
+        # time ranges and to label the returned timestamps (FAZ interprets the
+        # naive bounds in its own local TZ).
+        faz_tz = await client.get_system_timezone()
+        tz_name = str(faz_tz) if faz_tz else "unknown"
+        try:
+            time_range_dict = parse_time_range(time_range, faz_tz=faz_tz)
+        except ValueError as e:
+            return {"status": "error", "message": f"Invalid time_range: {e}"}
 
         # Build device filter
         device_filter = _build_device_filter(device)
 
-        # Step 1: Start log search
+        limit = _clamp_limit(limit)
+        offset = max(0, offset)
+
+        # Run this page as a self-contained search (FAZ tids are single-use).
         logger.info(f"Starting log search: adom={adom}, logtype={logtype}, filter={filter}")
-        start_result = await client.logsearch_start(
+        page = await _run_search_page(
+            client,
             adom=adom,
             logtype=logtype,
-            device=device_filter,
+            device_filter=device_filter,
             time_range=time_range_dict,
             filter=filter,
-            limit=limit,
             offset=offset,
+            limit=limit,
+            timeout=timeout,
         )
 
-        # Extract TID
-        tid = start_result.get("tid")
-        if not tid:
+        if page["timed_out"]:
             return {
                 "status": "error",
-                "message": f"Failed to start search: no TID returned. Response: {start_result}",
+                "error_type": "search_timeout",
+                "message": f"Search timed out after {timeout} seconds",
+                "adom": adom,
+                "time_range": time_range_dict,
+                "timezone": tz_name,
             }
 
-        logger.info(f"Log search started with TID: {tid}")
+        logs = page["logs"]
+        count = len(logs)
+        total = page["total"]
+        total_known = total is not None
+        has_more = _compute_has_more(offset, count, limit, total)
+        handle = page["tid"]
 
-        # Step 2: Poll for results
-        start_time = asyncio.get_event_loop().time()
-        while True:
-            elapsed = asyncio.get_event_loop().time() - start_time
-            if elapsed > timeout:
-                # Cancel the search
-                try:
-                    await client.logsearch_cancel(adom, tid)
-                except Exception:
-                    pass
-                return {
-                    "status": "error",
-                    "message": f"Search timed out after {timeout} seconds",
-                    "tid": tid,
-                }
+        # Record the search parameters under the handle so fetch_more_logs can
+        # reconstruct and re-run the query at a new offset (the appliance tid is
+        # already reaped). cancel_log_search clears the handle.
+        _register_search(
+            handle,
+            {
+                "adom": adom,
+                "logtype": logtype,
+                "filter": filter,
+                "device": device,
+                "time_range": time_range_dict,
+                "timezone": tz_name,
+            },
+        )
 
-            # Fetch results
-            fetch_result = await client.logsearch_fetch(
-                adom=adom,
-                tid=tid,
-                limit=limit,
-                offset=offset,
-            )
-
-            percentage = fetch_result.get("percentage", 0)
-            logger.debug(f"Search progress: {percentage}%")
-
-            # Check if complete
-            if percentage >= 100:
-                logs = fetch_result.get("data", [])
-                if not isinstance(logs, list):
-                    logs = [logs] if logs else []
-
-                return {
-                    "status": "success",
-                    "count": len(logs),
-                    "total": fetch_result.get("total-lines", len(logs)),
-                    "percentage": percentage,
-                    "logs": logs,
-                    "tid": tid,
-                }
-
-            # Wait before polling again
-            await asyncio.sleep(POLL_INTERVAL)
+        return {
+            "status": "success",
+            "count": count,
+            "total": total,
+            "total_known": total_known,
+            "percentage": 100,
+            "tid": handle,
+            "has_more": has_more,
+            "logs": logs,
+            "adom": adom,
+            "logtype": logtype,
+            "filter": filter,
+            "device": device,
+            "time_range": time_range_dict,
+            "timezone": tz_name,
+            "time_basis": (
+                f"time_range and log timestamps are interpreted in FAZ local time ({tz_name})"
+            ),
+            "returned_offset": offset,
+            "returned_limit": limit,
+        }
 
     except ValidationError as e:
         return {"status": "error", "message": f"Validation error: {e}"}
@@ -251,43 +460,39 @@ async def get_log_search_progress(
     adom: str | None = None,
     tid: int = 0,
 ) -> dict[str, Any]:
-    """Get progress of an ongoing log search.
+    """Report status of a query_logs pagination handle.
+
+    query_logs runs each search synchronously (it returns only after the page
+    has completed), and a FortiAnalyzer logsearch task is single-use and reaped
+    on completion. There is therefore no separately pollable in-progress task:
+    a known handle is already complete. Use fetch_more_logs(tid=...) to retrieve
+    further pages.
 
     Args:
-        adom: ADOM name (default: from config DEFAULT_ADOM)
-        tid: Task ID from a previous query_logs call
+        adom: Unused (kept for backward compatibility)
+        tid: Pagination handle from a previous query_logs call
 
     Returns:
-        dict: Search progress with keys:
-            - status: "success" or "error"
-            - progress_percent: Search progress (0-100)
-            - matched_logs: Number of matching logs found
-            - scanned_logs: Number of logs scanned so far
-            - total_logs: Total logs to scan
-            - message: Error message if failed
-
-    Example:
-        >>> result = await get_log_search_progress("root", 12345)
-        >>> print(f"Progress: {result['progress_percent']}%")
+        dict: status, progress_percent, note, and tid; or a structured
+        tid_invalid_or_expired error if the handle is unknown to this process.
     """
-    try:
-        if tid <= 0:
-            return {"status": "error", "message": "Invalid TID"}
+    if tid <= 0:
+        return {"status": "error", "message": "Invalid TID"}
 
-        adom = adom or get_default_adom()
-        client = _get_client()
-        result = await client.logsearch_count(adom, tid)
+    context = _get_search_context(tid)
+    if context is None:
+        return _tid_error_response(tid, get_default_adom(), "search handle is not known")
 
-        return {
-            "status": "success",
-            "progress_percent": result.get("progress-percent", 0),
-            "matched_logs": result.get("matched-logs", 0),
-            "scanned_logs": result.get("scanned-logs", 0),
-            "total_logs": result.get("total-logs", 0),
-        }
-    except Exception as e:
-        logger.error(f"Failed to get search progress: {e}")
-        return {"status": "error", "message": str(e)}
+    return {
+        "status": "success",
+        "progress_percent": 100,
+        "tid": tid,
+        "adom": context.get("adom"),
+        "note": (
+            "query_logs completes searches synchronously; there is no separately "
+            "pollable in-progress task. Use fetch_more_logs(tid=...) to page results."
+        ),
+    }
 
 
 @mcp.tool()
@@ -297,22 +502,31 @@ async def fetch_more_logs(
     limit: int = 100,
     offset: int = 0,
 ) -> dict[str, Any]:
-    """Fetch more logs from a completed search using TID.
+    """Fetch another page of a previous query_logs search using its handle.
 
-    Use this for pagination after an initial query_logs call.
+    Because a FortiAnalyzer logsearch tid is single-use, this re-runs the same
+    query (same ADOM, logtype, filter, device, and time window) at the requested
+    offset/limit using the search parameters recorded for `tid`. You normally
+    only pass tid/offset/limit. If the handle is unknown to this server process
+    (expired or from another process), the response is a structured error with
+    error_type="tid_invalid_or_expired" and a recommendation to re-run query_logs.
 
     Args:
-        adom: ADOM name (default: from config DEFAULT_ADOM)
-        tid: Task ID from a previous query_logs call
-        limit: Maximum logs to return (default: 100, max: 500)
+        adom: ADOM name (default: reuse the ADOM query_logs used for this handle)
+        tid: Reusable pagination handle from a previous query_logs call
+        limit: Maximum logs to return (default: 100)
         offset: Offset for pagination (default: 0)
 
     Returns:
         dict: Additional log results with keys:
             - status: "success" or "error"
-            - count: Number of logs returned
+            - count: Number of logs returned in this page
             - logs: List of log entries
-            - message: Error message if failed
+            - tid, adom: Echoed pagination context
+            - total, total_known, has_more: Pagination metadata
+            - returned_offset, returned_limit: Paging echoes
+            - timezone, time_basis: FAZ timezone context
+            - error_type, message, recommendation: On error (e.g. unknown handle)
 
     Example:
         >>> # Get first 100 logs
@@ -324,26 +538,78 @@ async def fetch_more_logs(
     """
     try:
         if tid <= 0:
-            return {"status": "error", "message": "Invalid TID"}
+            return {
+                "status": "error",
+                "message": "Invalid TID. Provide the tid returned by query_logs.",
+            }
 
-        adom = adom or get_default_adom()
+        # Reconstruct the search from the parameters recorded for this handle.
+        context = _get_search_context(tid)
+        if context is None:
+            return _tid_error_response(
+                tid,
+                adom or get_default_adom(),
+                "search handle is not known to this server process",
+            )
+
+        if adom is None:
+            adom = context["adom"]
+        adom = validate_adom(adom)
+
+        limit = _clamp_limit(limit)
+        offset = max(0, offset)
+
         client = _get_client()
-        result = await client.logsearch_fetch(
+        await client.ensure_connected()
+
+        page = await _run_search_page(
+            client,
             adom=adom,
-            tid=tid,
-            limit=limit,
+            logtype=context["logtype"],
+            device_filter=_build_device_filter(context.get("device")),
+            time_range=context["time_range"],
+            filter=context.get("filter"),
             offset=offset,
+            limit=limit,
+            timeout=DEFAULT_SEARCH_TIMEOUT,
         )
 
-        logs = result.get("data", [])
-        if not isinstance(logs, list):
-            logs = [logs] if logs else []
+        if page["timed_out"]:
+            return {
+                "status": "error",
+                "error_type": "search_timeout",
+                "message": f"Search timed out after {DEFAULT_SEARCH_TIMEOUT} seconds",
+                "tid": tid,
+                "adom": adom,
+            }
+
+        logs = page["logs"]
+        count = len(logs)
+        total = page["total"]
+        total_known = total is not None
+        has_more = _compute_has_more(offset, count, limit, total)
+        timezone = context.get("timezone", "unknown")
 
         return {
             "status": "success",
-            "count": len(logs),
+            "count": count,
             "logs": logs,
+            "tid": tid,
+            "adom": adom,
+            "logtype": context.get("logtype"),
+            "filter": context.get("filter"),
+            "device": context.get("device"),
+            "time_range": context.get("time_range"),
+            "total": total,
+            "total_known": total_known,
+            "has_more": has_more,
+            "returned_offset": offset,
+            "returned_limit": limit,
+            "timezone": timezone,
+            "time_basis": f"log timestamps are interpreted in FAZ local time ({timezone})",
         }
+    except ValidationError as e:
+        return {"status": "error", "message": f"Validation error: {e}"}
     except Exception as e:
         logger.error(f"Failed to fetch more logs: {e}")
         return {"status": "error", "message": str(e)}
@@ -354,31 +620,49 @@ async def cancel_log_search(
     adom: str | None = None,
     tid: int = 0,
 ) -> dict[str, Any]:
-    """Cancel an ongoing log search.
+    """Release a pagination handle (and the FAZ task if still alive).
+
+    Call this when you are done paging a query_logs result to free the in-process
+    handle. FortiAnalyzer reaps a completed logsearch task on its own, so the
+    appliance-side cancel is best-effort; clearing the handle always succeeds.
 
     Args:
-        adom: ADOM name (default: from config DEFAULT_ADOM)
-        tid: Task ID from a previous query_logs call
+        adom: ADOM name (default: reuse the ADOM recorded for this handle)
+        tid: Pagination handle from a previous query_logs call
 
     Returns:
         dict: Cancellation result with keys:
             - status: "success" or "error"
             - message: Status message
+            - tid, adom: Echoed context
 
     Example:
-        >>> result = await cancel_log_search("root", 12345)
+        >>> result = await cancel_log_search(tid=12345)
     """
     try:
         if tid <= 0:
             return {"status": "error", "message": "Invalid TID"}
 
-        adom = adom or get_default_adom()
+        # Use the ADOM query_logs ran under when the caller omits it.
+        context = _get_search_context(tid)
+        if adom is None:
+            adom = context["adom"] if context else get_default_adom()
+        adom = validate_adom(adom)
+
         client = _get_client()
-        await client.logsearch_cancel(adom, tid)
+        await client.ensure_connected()
+        # Best-effort: the task is usually already reaped by the appliance.
+        try:
+            await client.logsearch_cancel(adom, tid)
+        except Exception as exc:  # noqa: BLE001 - handle cleanup must still succeed
+            logger.debug(f"logsearch_cancel best-effort failed for handle {tid}: {exc}")
+        _unregister_search(tid)
 
         return {
             "status": "success",
-            "message": f"Search {tid} cancelled",
+            "message": f"Search {tid} released",
+            "tid": tid,
+            "adom": adom,
         }
     except Exception as e:
         logger.error(f"Failed to cancel search: {e}")
