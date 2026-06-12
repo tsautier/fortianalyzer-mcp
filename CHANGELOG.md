@@ -5,7 +5,7 @@ All notable changes to FortiAnalyzer MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.2.0] - 2026-06-11
+## [2.2.0] - 2026-06-12
 
 Fail closed: the streamable-HTTP transport now refuses to start without `MCP_AUTH_TOKEN` unless the operator explicitly opts out with `MCP_ALLOW_NO_AUTH=true`. PR [#25](https://github.com/rstierli/fortianalyzer-mcp/pull/25) by [@inxbit](https://github.com/inxbit). Closes [#20](https://github.com/rstierli/fortianalyzer-mcp/issues/20). 544 unit tests pass.
 
