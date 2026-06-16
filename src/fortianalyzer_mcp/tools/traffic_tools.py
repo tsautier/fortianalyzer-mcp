@@ -20,6 +20,7 @@ from typing import Any, cast
 
 from fortianalyzer_mcp.server import get_faz_client, mcp
 from fortianalyzer_mcp.tools.log_tools import (
+    _clamp_limit,
     _run_logsearch_page,
 )
 from fortianalyzer_mcp.utils.log_clock import resolve_time_window
@@ -278,32 +279,6 @@ async def _query_policy_log_slice(
     }
 
 
-async def _query_policy_total_count(
-    adom: str,
-    device_filter: list[dict[str, str]],
-    policy_id: int,
-    time_range: dict[str, str],
-    action: str | None,
-    timeout: int = DEFAULT_SEARCH_TIMEOUT,
-) -> dict[str, Any]:
-    """Query authoritative log-search total-count for one full policy window."""
-    result = await _query_policy_log_slice(
-        adom=adom,
-        device_filter=device_filter,
-        policy_id=policy_id,
-        time_range=time_range,
-        action=action,
-        limit=1,
-        timeout=timeout,
-    )
-    total_hits = result.get("total_hits")
-    total_hits_is_known = result.get("total_hits_is_known") is True
-    return {
-        "total_hits": total_hits if total_hits_is_known else None,
-        "total_hits_is_known": total_hits_is_known,
-    }
-
-
 async def _query_policy_logs(
     adom: str,
     device: str | None,
@@ -359,30 +334,29 @@ async def _query_policy_logs_bounded(
 
     ``time_range`` is the already-resolved ``{start, end}`` window (resolved once
     by the caller) so slices and reported metadata share one window.
+
+    The whole-window ``total_hits`` is the sum of the per-slice ``total-count``s
+    that the breakdown searches already return (issue #30). Slices are contiguous
+    and non-overlapping, so the sum is a valid whole-window count and is at least
+    the rows fetched. ``all_slices_exact`` is True only when every slice reported a
+    total equal to the rows it returned and below the fetch limit (every slice was
+    fully scanned); that is what makes a result "complete". A slice that timed out,
+    returned no TID, or omitted its total leaves the total unproven and forces a
+    bounded result.
     """
     async with _QUERY_SEMAPHORE:
         full_time_range = time_range
         device_filter = _build_device_filter(device)
+        # Clamp once with the runner's own helper so the truncation test below
+        # compares against the limit the runner actually applies.
+        effective_limit = _clamp_limit(limit)
         slice_count = _plan_policy_slice_count(full_time_range, policy_count)
         time_slices = _build_bounded_time_slices(full_time_range, slice_count)
         logs: list[dict[str, Any]] = []
         truncated_slices = 0
-        # The whole-window total-count is best-effort enrichment: its failure must
-        # never discard the per-slice observations (degrade to observed_rows).
-        try:
-            total_result = await _query_policy_total_count(
-                adom=adom,
-                device_filter=device_filter,
-                policy_id=policy_id,
-                time_range=full_time_range,
-                action=action,
-                timeout=timeout,
-            )
-        except Exception as exc:
-            logger.info(f"Total-count unavailable for policy {policy_id}: {exc}")
-            total_result = {"total_hits": None, "total_hits_is_known": False}
-        total_hits = total_result.get("total_hits")
-        total_hits_is_known = total_result.get("total_hits_is_known") is True
+        summed_total = 0
+        total_hits_is_known = True
+        all_slices_exact = True
 
         for time_slice in time_slices:
             slice_result = await _query_policy_log_slice(
@@ -391,22 +365,38 @@ async def _query_policy_logs_bounded(
                 policy_id=policy_id,
                 time_range=time_slice,
                 action=action,
-                limit=limit,
+                limit=effective_limit,
                 timeout=timeout,
             )
             slice_logs = slice_result.get("logs", [])
             if not isinstance(slice_logs, list):
                 slice_logs = []
             logs.extend(slice_logs)
-            if len(slice_logs) >= limit:
+            rows = len(slice_logs)
+            truncated = rows >= effective_limit
+            if truncated:
                 truncated_slices += 1
+
+            slice_total = slice_result.get("total_hits")
+            slice_known = slice_result.get("total_hits_is_known") is True and isinstance(
+                slice_total, int
+            )
+            if slice_known:
+                summed_total += cast(int, slice_total)
+            else:
+                total_hits_is_known = False
+            # A slice is exact only if it proved its total and was fully scanned.
+            all_slices_exact = (
+                all_slices_exact and slice_known and not truncated and slice_total == rows
+            )
 
         return {
             "logs": logs,
             "slices_scanned": len(time_slices),
             "truncated_slices": truncated_slices,
-            "total_hits": total_hits if total_hits_is_known else None,
+            "total_hits": summed_total if total_hits_is_known else None,
             "total_hits_is_known": total_hits_is_known,
+            "all_slices_exact": all_slices_exact,
         }
 
 
@@ -416,24 +406,36 @@ def _bounded_metadata(
     truncated_slices: int,
     total_hits: int | None = None,
     total_hits_is_known: bool = False,
+    all_slices_exact: bool = False,
+    policy_id: int | None = None,
 ) -> dict[str, Any]:
-    """Build common bounded-analysis response metadata."""
+    """Build common bounded-analysis response metadata.
+
+    ``total_hits`` is the sum of per-slice ``total-count``s (issue #30); it is at
+    least ``observed_hits`` by construction. A result is exact ("complete") only
+    when ``all_slices_exact`` -- every slice proved a total equal to its rows and
+    was fully scanned. Exactness is decided from that per-slice proof, not from an
+    aggregate ``observed == total`` comparison, so an over/under-count cancellation
+    across slices cannot fabricate completeness.
+    """
     authoritative = total_hits if (total_hits_is_known and total_hits is not None) else None
     if authoritative is not None:
-        # Defense against #30: the authoritative total comes from a limit=1
-        # logsearch whose `total-count` short-circuits unreliably on heavy
-        # traffic, sometimes reporting fewer hits than the breakdown actually
-        # observed. Clamp at the response boundary so the schema contract
-        # `total_hits >= observed_hits` always holds — otherwise a misleading
-        # tiny total breaks downstream audit decisions. Becomes a no-op once
-        # _query_policy_total_count is reworked to sum per-slice totals.
+        # Belt (the v2.4.1 defensive shim): the summed total is >= observed by
+        # construction, so this is normally a no-op. If it ever fires, the
+        # appliance under-reported a slice total; surface it, do not silently
+        # floor it.
         resolved_total_hits = max(authoritative, observed_hits)
-        # "complete" must mean the breakdown covers exactly the authoritative
-        # matching log count. Any mismatch keeps the result bounded.
-        is_exact = truncated_slices == 0 and observed_hits == authoritative
+        if authoritative < observed_hits:
+            logger.warning(
+                f"Policy {policy_id}: summed total-count {authoritative} below "
+                f"observed rows {observed_hits}; clamping to observed"
+            )
     else:
         resolved_total_hits = observed_hits
-        is_exact = truncated_slices == 0
+    # Exactness comes purely from per-slice proof. An unknown/unproven slice
+    # (timeout, no TID, omitted total) leaves all_slices_exact False, so a bounded
+    # result can never be mislabeled "complete".
+    is_exact = all_slices_exact
     metadata: dict[str, Any] = {
         "is_exact": is_exact,
         "analysis_mode": "complete" if is_exact else "bounded_sample",
@@ -672,6 +674,8 @@ async def _run_bounded_policy_analysis(
                         truncated_slices=policy_result["truncated_slices"],
                         total_hits=policy_result.get("total_hits"),
                         total_hits_is_known=policy_result.get("total_hits_is_known") is True,
+                        all_slices_exact=policy_result.get("all_slices_exact") is True,
+                        policy_id=pid,
                     )
                 )
                 entry["policy_id"] = pid
@@ -756,11 +760,13 @@ async def get_policy_traffic_profile(
             - adom, time_range, timezone: resolved query-window audit metadata
             - results: Per-policy traffic profiles with top ports, services, apps,
               plus per-policy total accounting:
-                - total_hits: authoritative whole-window match count when
-                  total_hits_is_known, else the observed row count
+                - total_hits: sum of per-slice total-counts when
+                  total_hits_is_known, else the observed row count. A floor that is
+                  always at least observed_hits, not the true total on heavy
+                  (bounded) policies
                 - total_hits_is_known / total_hit_source: True with
-                  "logsearch_total-count" when the total came from a FAZ
-                  whole-window total-count; False with "observed_rows" otherwise
+                  "logsearch_total-count" when every slice reported a total; False
+                  with "observed_rows" when any slice did not
                 - observed_hits: rows actually fetched and aggregated
                 Top ports/services/applications and their residuals describe the
                 observed rows only, not total_hits.
@@ -819,14 +825,17 @@ async def get_policy_port_analysis(
             - status: "success" or "error"
             - adom, time_range, timezone: resolved query-window audit metadata
             - results: Per-policy port analysis with:
-                - is_exact: True only when the breakdown covers every matching
-                  log (no truncated slice AND total_hits == observed_hits)
+                - is_exact: True only when every slice was fully scanned and
+                  proved its total (no truncated slice AND total_hits ==
+                  observed_hits)
                 - analysis_mode: "complete" or "bounded_sample"
-                - total_hits: authoritative whole-window match count when
-                  total_hits_is_known, else the observed row count
+                - total_hits: sum of per-slice total-counts when
+                  total_hits_is_known, else the observed row count. A floor that is
+                  always at least observed_hits, not the true total on heavy
+                  (bounded) policies
                 - total_hits_is_known / total_hit_source: True with
-                  "logsearch_total-count" when the total came from a FAZ
-                  whole-window total-count; False with "observed_rows" otherwise
+                  "logsearch_total-count" when every slice reported a total; False
+                  with "observed_rows" when any slice did not
                 - observed_hits: Number of log rows fetched and aggregated
                 - ports: List of port/protocol pairs with hit counts
                 - protocols: Protocol breakdown
@@ -887,7 +896,8 @@ async def get_policy_protocol_summary(
             - results: Per-policy protocol summaries with hit counts, plus
               total_hits / total_hits_is_known / total_hit_source and
               observed_hits (the protocol breakdown describes observed rows only;
-              total_hits is the authoritative whole-window count when known)
+              total_hits is the sum of per-slice total-counts, a floor at least
+              observed_hits, when known)
             - query_time_seconds: Total query duration
             - message: Error message if failed
 

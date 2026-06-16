@@ -4,6 +4,8 @@ Tests validation functions, aggregation logic, and tool behavior
 without triggering server initialization.
 """
 
+import logging
+
 import pytest
 
 import fortianalyzer_mcp.tools.log_tools as log_tools
@@ -21,7 +23,6 @@ from fortianalyzer_mcp.tools.traffic_tools import (
     _build_policy_filter,
     _plan_policy_slice_count,
     _query_policy_log_slice,
-    _query_policy_total_count,
     sanitize_filter_value,
     validate_action,
     validate_policy_ids,
@@ -443,38 +444,6 @@ class TestPolicyPortAnalysisToolBounded:
         assert result["total_hits"] == 25
         assert result["total_hits_is_known"] is True
 
-    async def test_policy_total_count_uses_full_window_with_small_fetch(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """Whole-window total queries should not depend on bounded slice totals."""
-        calls = []
-
-        async def fake_slice(*_args: object, **kwargs: object) -> dict[str, object]:
-            calls.append(kwargs)
-            return {
-                "logs": [{"dstport": 443, "proto": "6"}],
-                "total_hits": 12609,
-                "total_hits_is_known": True,
-            }
-
-        monkeypatch.setattr(traffic_tools, "_query_policy_log_slice", fake_slice)
-
-        result = await _query_policy_total_count(
-            adom="root",
-            device_filter=[{"devid": "All_FortiGate"}],
-            policy_id=29,
-            time_range={"start": "2024-01-01 00:00:00", "end": "2024-01-31 00:00:00"},
-            action="accept",
-        )
-
-        assert result == {"total_hits": 12609, "total_hits_is_known": True}
-        assert calls[0]["time_range"] == {
-            "start": "2024-01-01 00:00:00",
-            "end": "2024-01-31 00:00:00",
-        }
-        assert calls[0]["limit"] == 1
-
     async def test_large_request_returns_bounded_result(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -498,11 +467,6 @@ class TestPolicyPortAnalysisToolBounded:
             }
 
         monkeypatch.setattr(traffic_tools, "_query_policy_log_slice", fake_slice)
-
-        async def fake_total(*_args: object, **_kwargs: object) -> dict[str, object]:
-            return {"total_hits": 2503, "total_hits_is_known": True}
-
-        monkeypatch.setattr(traffic_tools, "_query_policy_total_count", fake_total)
 
         result = await traffic_tools.get_policy_port_analysis(
             adom="root",
@@ -528,24 +492,24 @@ class TestPolicyPortAnalysisToolBounded:
         assert "estimate_available" not in analysis
         assert "recommendation" in analysis
 
-    async def test_bounded_result_uses_whole_window_total_count(
+    async def test_bounded_result_sums_per_slice_totals(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Bounded metadata should not sum inflated per-slice totals."""
+        """Whole-window total_hits is the sum of per-slice total-counts (issue #30)."""
+        call_count = 0
 
         async def fake_slice(*_args: object, **_kwargs: object) -> dict[str, object]:
+            nonlocal call_count
+            call_count += 1
+            rows = call_count  # slices return 1, 2, 3, 4 rows, each fully scanned
             return {
-                "logs": [{"dstport": 161, "proto": "17"}],
-                "total_hits": 14000,
+                "logs": [{"dstport": 161, "proto": "17"} for _ in range(rows)],
+                "total_hits": rows,
                 "total_hits_is_known": True,
             }
 
-        async def fake_total(*_args: object, **_kwargs: object) -> dict[str, object]:
-            return {"total_hits": 12609, "total_hits_is_known": True}
-
         monkeypatch.setattr(traffic_tools, "_query_policy_log_slice", fake_slice)
-        monkeypatch.setattr(traffic_tools, "_query_policy_total_count", fake_total, raising=False)
 
         result = await traffic_tools.get_policy_port_analysis(
             adom="root",
@@ -557,16 +521,16 @@ class TestPolicyPortAnalysisToolBounded:
 
         assert result["status"] == "success"
         analysis = result["results"][0]
-        assert analysis["total_hits"] == 12609
+        # 4 slices returned 1+2+3+4 rows, each with total-count == its rows.
+        assert analysis["observed_hits"] == 10
+        assert analysis["total_hits"] == 10
         assert analysis["total_hits_is_known"] is True
         assert analysis["total_hit_source"] == "logsearch_total-count"
-        assert analysis["observed_hits"] == 4
-        assert analysis["ports"] == [{"port": "17/161", "hits": 4}]
-        # An authoritative total that dwarfs the observed rows must NOT be
-        # labelled "complete": the port breakdown only covers observed rows.
-        assert analysis["is_exact"] is False
-        assert analysis["analysis_mode"] == "bounded_sample"
-        assert "recommendation" in analysis
+        assert analysis["ports"] == [{"port": "17/161", "hits": 10}]
+        # Every slice fully scanned (total == rows, none truncated) -> complete.
+        assert analysis["is_exact"] is True
+        assert analysis["analysis_mode"] == "complete"
+        assert "recommendation" not in analysis
 
     async def test_missing_slice_total_falls_back_to_observed_rows(
         self,
@@ -595,10 +559,13 @@ class TestPolicyPortAnalysisToolBounded:
 
         assert result["status"] == "success"
         analysis = result["results"][0]
-        assert analysis["is_exact"] is True
+        # An unproven slice total (omitted total-count) cannot be "complete".
+        assert analysis["is_exact"] is False
+        assert analysis["analysis_mode"] == "bounded_sample"
         assert analysis["total_hits"] == 1
         assert analysis["total_hits_is_known"] is False
         assert analysis["total_hit_source"] == "observed_rows"
+        assert "recommendation" in analysis
         assert "estimated_total_hits" not in analysis
 
     async def test_per_policy_exceptions_are_isolated(
@@ -755,11 +722,6 @@ class TestPolicyTrafficProfileToolBounded:
 
         monkeypatch.setattr(traffic_tools, "_query_policy_log_slice", fake_slice)
 
-        async def fake_total(*_args: object, **_kwargs: object) -> dict[str, object]:
-            return {"total_hits": 4, "total_hits_is_known": True}
-
-        monkeypatch.setattr(traffic_tools, "_query_policy_total_count", fake_total)
-
         result = await traffic_tools.get_policy_traffic_profile(
             adom="root",
             device="FGT70FTK22019321",
@@ -811,11 +773,6 @@ class TestPolicyProtocolSummaryToolBounded:
             }
 
         monkeypatch.setattr(traffic_tools, "_query_policy_log_slice", fake_slice)
-
-        async def fake_total(*_args: object, **_kwargs: object) -> dict[str, object]:
-            return {"total_hits": 1203, "total_hits_is_known": True}
-
-        monkeypatch.setattr(traffic_tools, "_query_policy_total_count", fake_total)
 
         result = await traffic_tools.get_policy_protocol_summary(
             adom="root",
@@ -1034,47 +991,6 @@ class TestQueryPolicySliceReliability:
 
 
 # =============================================================================
-# Whole-window total-count: best-effort enrichment
-# =============================================================================
-
-
-class TestTotalCountBestEffort:
-    """The whole-window total-count is enrichment; its failure must not discard
-    the per-policy observed breakdown."""
-
-    async def test_total_count_failure_keeps_observed_result(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        async def good_slice(*_args: object, **_kwargs: object) -> dict[str, object]:
-            return {
-                "logs": [{"dstport": 443, "proto": "6"}],
-                "total_hits": None,
-                "total_hits_is_known": False,
-            }
-
-        async def boom_total(*_args: object, **_kwargs: object) -> dict[str, object]:
-            raise RuntimeError("total-count search failed")
-
-        monkeypatch.setattr(traffic_tools, "_query_policy_log_slice", good_slice)
-        monkeypatch.setattr(traffic_tools, "_query_policy_total_count", boom_total)
-
-        result = await traffic_tools.get_policy_port_analysis(
-            adom="root",
-            device="FGT70FTK22019321",
-            policy_ids=[2],
-            time_range="2024-01-01 00:00:00|2024-01-02 00:00:00",
-        )
-
-        assert result["status"] == "success"
-        analysis = result["results"][0]
-        assert "error" not in analysis
-        assert analysis["observed_hits"] == 1
-        assert analysis["total_hits_is_known"] is False
-        assert analysis["total_hit_source"] == "observed_rows"
-        assert analysis["total_hits"] == 1
-
-
-# =============================================================================
 # Bounded metadata: honesty gate + observed floor
 # =============================================================================
 
@@ -1089,6 +1005,7 @@ class TestBoundedMetadata:
             truncated_slices=0,
             total_hits=100,
             total_hits_is_known=True,
+            all_slices_exact=False,
         )
         assert md["total_hits"] == 100
         assert md["total_hit_source"] == "logsearch_total-count"
@@ -1096,17 +1013,21 @@ class TestBoundedMetadata:
         assert md["analysis_mode"] == "bounded_sample"
         assert "recommendation" in md
 
-    def test_unknown_total_cannot_flip_exactness(self) -> None:
+    def test_unknown_total_is_never_complete(self) -> None:
+        """An unproven total (slice timed out / omitted total) is never complete."""
         md = _bounded_metadata(
             observed_hits=4,
             slices_scanned=1,
             truncated_slices=0,
             total_hits=None,
             total_hits_is_known=False,
+            all_slices_exact=False,
         )
         assert md["total_hits"] == 4
         assert md["total_hit_source"] == "observed_rows"
-        assert md["is_exact"] is True
+        assert md["is_exact"] is False
+        assert md["analysis_mode"] == "bounded_sample"
+        assert "recommendation" in md
 
     def test_total_equal_to_observed_is_complete(self) -> None:
         md = _bounded_metadata(
@@ -1115,6 +1036,7 @@ class TestBoundedMetadata:
             truncated_slices=0,
             total_hits=4,
             total_hits_is_known=True,
+            all_slices_exact=True,
         )
         assert md["is_exact"] is True
         assert md["analysis_mode"] == "complete"
@@ -1137,6 +1059,7 @@ class TestBoundedMetadata:
             truncated_slices=0,
             total_hits=2,
             total_hits_is_known=True,
+            all_slices_exact=False,
         )
         # Clamped up to observed (was the broken authoritative value of 2).
         assert md["total_hits"] == 5
@@ -1148,6 +1071,169 @@ class TestBoundedMetadata:
         assert md["is_exact"] is False
         assert md["analysis_mode"] == "bounded_sample"
         assert "recommendation" in md
+
+    def test_belt_clamp_below_observed_logs_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        """If the summed total ever lands below observed, clamp AND log it."""
+        with caplog.at_level(logging.WARNING, logger="fortianalyzer_mcp.tools.traffic_tools"):
+            md = _bounded_metadata(
+                observed_hits=5,
+                slices_scanned=1,
+                truncated_slices=0,
+                total_hits=2,
+                total_hits_is_known=True,
+                all_slices_exact=False,
+                policy_id=7,
+            )
+        assert md["total_hits"] == 5
+        assert any(
+            "Policy 7" in record.message and "below" in record.message for record in caplog.records
+        )
+
+
+# =============================================================================
+# issue #30: total_hits summed from per-slice totals; per-slice exactness
+# =============================================================================
+
+
+class TestPerSliceTotalSum:
+    """`_query_policy_logs_bounded` sums per-slice total-counts and proves
+    exactness per slice (issue #30)."""
+
+    @staticmethod
+    def _window_30d() -> dict[str, str]:
+        return {"start": "2024-01-01 00:00:00", "end": "2024-01-31 00:00:00"}
+
+    async def test_sums_known_slice_totals(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        totals = [10, 20, 30]
+        idx = 0
+
+        async def fake_slice(*_args: object, **_kwargs: object) -> dict[str, object]:
+            nonlocal idx
+            count = totals[idx]
+            idx += 1
+            return {
+                "logs": [{"dstport": 443, "proto": "6"} for _ in range(count)],
+                "total_hits": count,
+                "total_hits_is_known": True,
+            }
+
+        monkeypatch.setattr(traffic_tools, "_query_policy_log_slice", fake_slice)
+        result = await traffic_tools._query_policy_logs_bounded(
+            "root", "FGT70FTK22019321", 2, self._window_30d(), None, policy_count=8
+        )
+        assert result["slices_scanned"] == 3
+        assert result["total_hits"] == 60
+        assert result["total_hits_is_known"] is True
+        assert result["all_slices_exact"] is True
+        assert len(result["logs"]) == 60
+
+    async def test_one_unknown_slice_makes_total_unknown(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        idx = 0
+
+        async def fake_slice(*_args: object, **_kwargs: object) -> dict[str, object]:
+            nonlocal idx
+            idx += 1
+            if idx == 2:
+                return {
+                    "logs": [{"dstport": 80, "proto": "6"}],
+                    "total_hits": None,
+                    "total_hits_is_known": False,
+                }
+            return {
+                "logs": [{"dstport": 443, "proto": "6"}],
+                "total_hits": 1,
+                "total_hits_is_known": True,
+            }
+
+        monkeypatch.setattr(traffic_tools, "_query_policy_log_slice", fake_slice)
+        result = await traffic_tools._query_policy_logs_bounded(
+            "root", "FGT70FTK22019321", 2, self._window_30d(), None, policy_count=8
+        )
+        assert result["total_hits"] is None
+        assert result["total_hits_is_known"] is False
+        assert result["all_slices_exact"] is False
+        assert len(result["logs"]) == 3  # rows still accumulate
+
+    async def test_nontruncated_total_above_rows_is_not_exact(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def fake_slice(*_args: object, **_kwargs: object) -> dict[str, object]:
+            return {
+                "logs": [{"dstport": 443, "proto": "6"}],
+                "total_hits": 5,
+                "total_hits_is_known": True,
+            }
+
+        monkeypatch.setattr(traffic_tools, "_query_policy_log_slice", fake_slice)
+        result = await traffic_tools._query_policy_logs_bounded(
+            "root", "FGT70FTK22019321", 2, self._window_30d(), None, policy_count=8
+        )
+        assert result["truncated_slices"] == 0
+        assert result["total_hits"] == 15
+        assert result["all_slices_exact"] is False
+
+    async def test_undercounting_slice_is_not_exact(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async def fake_slice(*_args: object, **_kwargs: object) -> dict[str, object]:
+            return {
+                "logs": [{"dstport": 443, "proto": "6"} for _ in range(3)],
+                "total_hits": 2,
+                "total_hits_is_known": True,
+            }
+
+        monkeypatch.setattr(traffic_tools, "_query_policy_log_slice", fake_slice)
+        result = await traffic_tools._query_policy_logs_bounded(
+            "root", "FGT70FTK22019321", 2, self._window_30d(), None, policy_count=8
+        )
+        assert result["all_slices_exact"] is False
+
+    async def test_clamps_limit_with_runner_helper(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        seen_limits: list[int] = []
+
+        async def fake_slice(*_args: object, limit: int, **_kwargs: object) -> dict[str, object]:
+            seen_limits.append(limit)
+            return {
+                "logs": [{"dstport": 443, "proto": "6"}],
+                "total_hits": 1,
+                "total_hits_is_known": True,
+            }
+
+        monkeypatch.setattr(traffic_tools, "_query_policy_log_slice", fake_slice)
+        await traffic_tools._query_policy_logs_bounded(
+            "root", "FGT70FTK22019321", 2, self._window_30d(), None, policy_count=8, limit=99999
+        )
+        # _clamp_limit caps at LOG_FETCH_LIMIT (1000); the slice never sees 99999.
+        assert seen_limits and all(seen == LOG_FETCH_LIMIT for seen in seen_limits)
+
+    async def test_timed_out_slice_makes_tool_bounded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        idx = 0
+
+        async def fake_slice(*_args: object, **_kwargs: object) -> dict[str, object]:
+            nonlocal idx
+            idx += 1
+            if idx == 1:
+                return {"logs": [], "total_hits": None, "total_hits_is_known": False}
+            return {
+                "logs": [{"dstport": 443, "proto": "6"}],
+                "total_hits": 1,
+                "total_hits_is_known": True,
+            }
+
+        monkeypatch.setattr(traffic_tools, "_query_policy_log_slice", fake_slice)
+        result = await traffic_tools.get_policy_port_analysis(
+            adom="root",
+            device="FGT70FTK22019321",
+            policy_ids=[2],
+            time_range="2024-01-01 00:00:00|2024-01-31 00:00:00",
+        )
+        analysis = result["results"][0]
+        assert analysis["is_exact"] is False
+        assert analysis["analysis_mode"] == "bounded_sample"
+        assert analysis["total_hits_is_known"] is False
+        assert analysis["total_hit_source"] == "observed_rows"
 
 
 # =============================================================================
