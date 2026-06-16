@@ -5,6 +5,18 @@ All notable changes to FortiAnalyzer MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Real fix for the policy `total_hits` under-report ([#30](https://github.com/rstierli/fortianalyzer-mcp/issues/30), variant 2): sum the per-slice `total-count`s the breakdown already fetches instead of a separate `limit=1` whole-window logsearch. Removes the v2.4.1 clamp's reason to exist (kept as a guard) and decides exactness per slice. By [@inxbit](https://github.com/inxbit). 559 unit tests pass.
+
+### Fixed
+- **`get_policy_traffic_profile` / `get_policy_port_analysis` / `get_policy_protocol_summary` no longer report `total_hits` below `observed_hits`, and now report it correctly when the window is fully scanned.** The total came from `_query_policy_total_count`, a `limit=1` logsearch whose `total-count` short-circuits the instant the first match is found, so it returned a tiny scanned-block count rather than the real total (observed 44 vs 4,000 on heavy policies, and as low as 37 vs 1,151 in a real audit). That function is deleted. `_query_policy_logs_bounded` now sums the `total-count` each per-slice breakdown search already returns and discards. Slices are contiguous and non-overlapping and each slice's `total-count` is at least the rows it returned, so the summed `total_hits` is `>= observed_hits` by construction. This also drops one FAZ logsearch per policy (was `slice_count + 1`, now `slice_count`).
+- **`is_exact` ("complete") is decided per slice and can no longer mislabel an unproven result.** A result is exact only when every slice reported a `total-count` equal to the rows it returned and below the fetch limit, i.e. every slice was fully scanned. The previous rule was `truncated_slices == 0`, which would call a result "complete" even when a slice timed out or omitted its total (0 rows, not counted as truncated). Exactness is now computed from the raw per-slice proof, so an aggregate over/under-count cancellation cannot fabricate completeness.
+
+### Changed
+- The v2.4.1 defensive clamp (`max(authoritative, observed_hits)` at `_bounded_metadata`) is kept as a belt rather than removed: with variant 2 the summed total is `>= observed_hits` by construction so it is normally a no-op, but if a slice ever under-reports below its own rows the clamp still holds the schema contract and now logs a warning instead of silently flooring. The clamped display value is never used to decide `is_exact`.
+- Tool docstrings, `README.md`, and `docs/INTERNAL_ARCHITECTURE.md` now describe `total_hits` as the sum of per-slice `total-count`s (a floor that is at least `observed_hits`), not an "authoritative whole-window" count.
+
 ## [2.5.0] - 2026-06-16
 
 Type safety + internals refactor and a session-expired re-login signal. PRs [#33](https://github.com/rstierli/fortianalyzer-mcp/pull/33) and [#34](https://github.com/rstierli/fortianalyzer-mcp/pull/34) by [@inxbit](https://github.com/inxbit). 554 unit tests pass.
