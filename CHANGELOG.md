@@ -5,7 +5,7 @@ All notable changes to FortiAnalyzer MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.7.0] - 2026-07-03
 
 Full-codebase correctness and security-hardening review: uniform identifier validation, config/env parsing fix, task-state handling, device-filter classification, report custom time windows, and deployment hardening.
 
