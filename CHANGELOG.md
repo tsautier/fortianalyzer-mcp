@@ -5,7 +5,9 @@ All notable changes to FortiAnalyzer MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.7.2] - 2026-07-09
+
+Patch release: two request-shape bugs in tools that had never worked against a live FAZ — both found by the skills-layer live validation (#44 / PR #46), spec-verified against the bundled 7.6.7/8.0.0 FNDN specs (which agree), confirmed by Roland against FNDN, and live-verified after the fix (PRs #48, #50).
 
 ### Fixed
 - **`get_incident` works again: single-incident retrieval goes through the plural `incidents` endpoint.** `GET /incidentmgmt/adom/{adom}/incident/{incid}` does not exist — that path is update-only, and FAZ rejects a GET on it with `Not supported method`, so the tool had never returned data. Retrieval now uses `GET /incidentmgmt/adom/{adom}/incidents` with `incids=[incident_id]` (per the bundled 7.6.7/8.0.0 specs, which agree) at the default detail level — `extended` drops `severity`/`status` (verified live) — unwrapping the single record and raising a clear not-found error for an empty match. Verified live. Closes [#49](https://github.com/rstierli/fortianalyzer-mcp/issues/49).
