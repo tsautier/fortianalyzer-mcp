@@ -36,6 +36,8 @@ This MCP server provides a comprehensive interface to FortiAnalyzer's capabiliti
 | **IOC Analysis** | Run IOC rescans, check license status, view rescan history |
 | **Device Management** | List/add/delete devices, manage device groups and VDOMs |
 | **System** | System status, HA status, ADOM management, task monitoring |
+| **Skills Layer** *(beta)* | `faz_skill` dispatcher: opinionated multi-tool orchestrations (incident correlation, triage, incident summaries) with validated, versioned output schemas — off by default |
+| **Data Masking** *(beta)* | Reversible FPE masking of IOC/PII fields (IPs, MACs, hostnames, usernames, domains, emails) in tool outputs, with automatic unmasking of tokens in tool arguments — off by default |
 
 ## Requirements
 
@@ -182,6 +184,14 @@ LOG_LEVEL=INFO  # DEBUG for troubleshooting
 # The MCP SDK rejects non-localhost Host headers by default for DNS rebinding protection.
 # Examples: ["mcp.example.com"], ["10.1.5.62:8001"], or wildcard ["10.1.5.62:*"]
 # MCP_ALLOWED_HOSTS=["mcp.example.com"]
+
+# Skills layer (beta, optional — see "Skills Layer" below)
+# FAZ_SKILLS_ENABLED=true
+
+# Reversible data masking (beta, optional — see "Data Masking" below)
+# MASKING_ENABLED=true
+# FAZ_MASKING_KEY=<32/48/64 hex chars, e.g. from: openssl rand -hex 16>
+# FAZ_MASK_DEVICE_IDENTITY=false
 ```
 
 ### Generating an API Token
@@ -611,6 +621,34 @@ the summed per-slice total.
 "List all devices in the root ADOM"
 "Show me the HA cluster status"
 ```
+
+## Skills Layer (beta)
+
+With `FAZ_SKILLS_ENABLED=true`, one additional tool is registered: `faz_skill(skill, params)` — a dispatcher for opinionated multi-tool orchestrations that return validated, versioned structured results (`schema_version` in every response). Off by default; no behavior change unless enabled.
+
+| Skill | Tier | What it does |
+|---|---|---|
+| `incidents` | data access | Incidents in a time window, each with attachment-correlated alerts |
+| `reports` | data access | List generated reports, or fetch one by task ID (PDF/HTML/CSV/XML) |
+| `log_search` | data access | Filter-based log search returning verbatim rows (slot-safe: one search per call) |
+| `triage` | analysis | Evidence bundle + deterministic severity-derived assessment for one alert or incident |
+| `incident_summary` | analysis | Structured incident summary: related alerts with evidence logs, threat landscape, timeline |
+
+- `faz_skill(skill="list")` (alias `"describe"`) returns the machine-readable catalogue including each skill's parameter and output JSON schema.
+- All skills are read-only and additive — zero changes to the existing tools.
+- Requires FortiAnalyzer **7.6.7+**. Not available in `FAZ_TOOL_MODE=dynamic` (beta limitation).
+- Skill ids and output schemas are a stable contract; breaking changes bump `schema_version`.
+
+## Data Masking (beta)
+
+With `MASKING_ENABLED=true` (requires `FAZ_MASKING_KEY`), sensitive identifiers are pseudonymized before they leave the server toward the LLM, and masked tokens the model sends back as tool arguments are resolved to real values before input validation and the FortiAnalyzer API. Off by default; no behavior change unless enabled.
+
+- **What masks:** IPv4/IPv6, MACs, hostnames, usernames (case-preserving), domains and emails across allowlisted fields at any nesting depth, composite keys (`groupby1`, `grpby`, `target[]`, `devvds`, `http_url`, the fortiview `threat`/`obf_url` pair), and free-text fields (`msg`, `subject`, echoed filters, ...).
+- **Token design:** deterministic format-preserving encryption (NIST FF3-1) — the same value always yields the same token, so the model can correlate across calls, and values are recoverable from the key alone (no token vault). Hostname/username/domain/email tokens carry recognizable markers plus a short key-id, so tokens from a rotated key fail loudly instead of decrypting to plausible wrong values.
+- **Fail-closed:** an unmaskable value becomes an irreversible placeholder; if masking a response fails entirely, the raw result is withheld behind a `masking_failed` error.
+- **Device identity** (`devname`, `devid`, `sn`, ...) stays readable by default so the model can reason about which appliance saw what; set `FAZ_MASK_DEVICE_IDENTITY=true` to mask it too.
+- **Key handling:** `FAZ_MASKING_KEY` is a 32/48/64-hex-char AES key (`openssl rand -hex 16`). Rotating the key invalidates previously issued tokens by design.
+- **Documented limits (beta):** masked IPs/MACs carry no marker (a full address space cannot be marked), so an operator-typed real IP in an argument is indistinguishable from a token; URL *hosts* are masked inside `http_url` but URL paths/queries are not; the model's final prose is outside the MCP's reach and needs a client-side companion (planned).
 
 ## Tool Modes
 
