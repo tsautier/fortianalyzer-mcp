@@ -5,7 +5,9 @@ All notable changes to FortiAnalyzer MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.9.0] - 2026-07-12
+
+Minor release: reversible data masking, RFC #40 Phases 0-2 — beta, behind `MASKING_ENABLED` (default **off**; no behavior change unless enabled; requires `FAZ_MASKING_KEY`). Flag-on live-validated on two estates across FAZ 7.6.7 and 8.0.0.
 
 ### Fixed
 - **The browsed destination no longer leaks through `http_url` and `host_name` targets on webfilter alerts.** A flag-on leak sweep against a second estate found the domain that `host_name` masks surviving one key away, inside the full URL of `event_details.http_url` (`https://<domain>/`) and as a `target[]` entry named `host_name` — a target name the allowlist did not know. `host_name` targets now mask with the IP-or-host logic (same token as the flat `host_name` field), and `http_url` masks its HOST component in place while scheme, path and query stay clear — URLs with embedded credentials fail closed, and non-URL values fall back to the free-text scan. Path/query segments embedding identifiers remain a documented residual of the deferred full-URL token design.
