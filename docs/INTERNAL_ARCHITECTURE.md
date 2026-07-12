@@ -83,25 +83,48 @@ This document provides a deep technical understanding of how the FortiAnalyzer M
 src/fortianalyzer_mcp/
 ├── __init__.py           # Package initialization
 ├── __main__.py           # Entry point for `python -m fortianalyzer_mcp`
-├── server.py             # MCP server implementation (519 lines)
+├── server.py             # MCP server implementation (643 lines)
 ├── api/
 │   ├── __init__.py
-│   └── client.py         # FortiAnalyzer API client (1451 lines)
+│   └── client.py         # FortiAnalyzer API client (1835 lines)
 ├── tools/
 │   ├── __init__.py       # Tool exports
-│   ├── system_tools.py   # System/ADOM/device tools (13K)
-│   ├── log_tools.py      # Log search tools (24K)
-│   ├── report_tools.py   # Report generation tools (28K)
-│   ├── fortiview_tools.py # FortiView analytics (17K)
-│   ├── event_tools.py    # Alert management (10K)
-│   ├── incident_tools.py # Incident management (10K)
-│   ├── ioc_tools.py      # IOC analysis (10K)
-│   └── dvm_tools.py      # Device management (15K)
+│   ├── system_tools.py   # System/ADOM tools
+│   ├── log_tools.py      # Log search tools
+│   ├── report_tools.py   # Report generation tools
+│   ├── fortiview_tools.py # FortiView analytics
+│   ├── event_tools.py    # Alert management
+│   ├── incident_tools.py # Incident management
+│   ├── ioc_tools.py      # IOC analysis
+│   ├── pcap_tools.py     # PCAP search/download
+│   ├── traffic_tools.py  # Policy traffic analysis
+│   └── dvm_tools.py      # Device management
+├── skills/               # Skills layer (beta, FAZ_SKILLS_ENABLED — RFC #44)
+│   ├── catalog.py        # SkillSpec registry + machine-readable catalogue
+│   ├── dispatcher.py     # faz_skill(skill, params) dispatcher tool
+│   ├── handlers.py       # Orchestrations composed from the raw tools
+│   └── models.py         # Versioned pydantic parameter/output schemas
+├── masking/              # Reversible data masking (beta, MASKING_ENABLED — RFC #40)
+│   ├── fields.py         # Verified field allowlist + type/composite tables
+│   ├── fpe_engine.py     # FF3-1 format-preserving token engine
+│   ├── unmask.py         # Tool-argument unmasking (tokens → real values)
+│   └── wrapper.py        # Tool-boundary output masking + install_masking patch
 └── utils/
     ├── __init__.py
-    ├── config.py         # Settings/configuration (205 lines)
-    └── errors.py         # Exception classes (103 lines)
+    ├── config.py         # Settings/configuration
+    ├── errors.py         # Exception classes
+    ├── log_clock.py      # FAZ time-basis handling
+    ├── responses.py      # Shared response helpers
+    ├── time_range.py     # Time-range parsing (single source of truth)
+    └── validation.py     # Input validation and log sanitization
 ```
+
+---
+
+### Optional Layers (beta, flag-gated)
+
+- **Skills layer** (`skills/`, `FAZ_SKILLS_ENABLED`): registers exactly one extra tool, `faz_skill`, which validates parameters against per-skill pydantic models, runs an orchestration over the raw tool functions, and validates the output schema before returning (validation failure is a skill error, never a malformed passthrough). Composition-root only — zero edits to existing tool modules.
+- **Masking layer** (`masking/`, `MASKING_ENABLED`): `install_masking` patches `mcp.tool` before tool modules import, so every registered tool unmasks its arguments on the way in and masks its result on the way out at the OUTERMOST call boundary only (a contextvar guard keeps nested tool-to-tool calls bare). Deterministic FF3-1 tokens, fail-closed placeholders, response-scoped free-text substitution. Module docstrings in `masking/` carry the full design record.
 
 ---
 
