@@ -125,6 +125,18 @@ class Settings(BaseSettings):
         description="Tool loading mode: 'full' loads all tools, 'dynamic' loads meta-tools only",
     )
 
+    # Reversible data masking (RFC #40) — additive, off by default
+    MASKING_ENABLED: bool = Field(
+        default=False,
+        description="Mask IOC/PII fields in tool outputs via FPE (requires FAZ_MASKING_KEY). "
+        "Off by default; no behavior change unless enabled.",
+    )
+    FAZ_MASK_DEVICE_IDENTITY: bool = Field(
+        default=False,
+        description="Also mask device-identity fields (devname, devid, sn, csf). "
+        "Off by default: these identify the reporting estate, not people, and masking "
+        "them costs the model its sense of which appliance saw what.",
+    )
     # Skills layer (RFC #44) — additive, off by default
     FAZ_SKILLS_ENABLED: bool = Field(
         default=False,
