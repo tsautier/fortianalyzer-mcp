@@ -646,3 +646,113 @@ class TestHandlerDescription:
         masked = masker.mask_result(HANDLER)
         assert GATEWAY_IP not in masked["description"]
         assert SOC_EMAIL not in masked["description"]
+
+
+class TestUrlFullMasking:
+    """``url``/``referralurl``: host masks in place, the whole tail
+    (path+query+fragment) seals into one reversible ``url-`` token.
+    Maintainer decision on #40: these fields are carry-and-reverse, not
+    greppable; scheme and port stay clear; credentials fail closed."""
+
+    def test_tail_identifiers_do_not_survive(self, masker: OutputMasker):
+        raw = f"https://{BAD_DOMAIN}/employees/{ANALYST}/profile?dept=finance&user={ANALYST}#t"
+        masked = masker.mask_result({"url": raw})
+        out = masked["url"]
+        assert BAD_DOMAIN not in out
+        assert ANALYST not in out
+        assert "finance" not in out
+        assert "employees" not in out
+
+    def test_masked_url_shape(self, masker: OutputMasker):
+        masked = masker.mask_result({"url": f"https://{BAD_DOMAIN}/a/b?c=d"})
+        out = masked["url"]
+        scheme, rest = out.split("://", 1)
+        assert scheme == "https"
+        host_part, _, tail_part = rest.partition("/")
+        assert host_part.startswith("host-")
+        assert tail_part.startswith("url-") and "/" not in tail_part
+
+    def test_bare_host_and_bare_slash_stay_distinct(self, masker: OutputMasker):
+        no_slash = masker.mask_result({"url": f"https://{BAD_DOMAIN}"})["url"]
+        with_slash = masker.mask_result({"url": f"https://{BAD_DOMAIN}/"})["url"]
+        assert no_slash != with_slash
+        assert "url-" not in no_slash  # empty remainder short-circuits
+        assert "url-" in with_slash  # bare / goes through the token path
+
+    def test_referralurl_same_treatment_and_host_correlates(self, masker: OutputMasker):
+        masked = masker.mask_result(
+            {"referralurl": f"https://{BAD_DOMAIN}/from?x=1", "host_name": BAD_DOMAIN}
+        )
+        host_token = masked["host_name"]
+        assert masked["referralurl"].startswith(f"https://{host_token}/url-")
+
+    def test_userinfo_fails_closed_whole_value(self, masker: OutputMasker):
+        masked = masker.mask_result({"url": f"https://{ANALYST}:secret@{BAD_DOMAIN}/x"})
+        assert masked["url"].startswith("masked-unrepresentable-")
+        assert ANALYST not in masked["url"] and "secret" not in masked["url"]
+
+    def test_port_preserved_scheme_clear(self, masker: OutputMasker):
+        masked = masker.mask_result({"url": f"https://{BAD_DOMAIN}:8443/x/y"})
+        assert masked["url"].startswith("https://host-")
+        assert ":8443/" in masked["url"]
+
+    def test_non_url_value_seals_whole(self, masker: OutputMasker):
+        # No parseable host: anything lands in the whole-value seal, so
+        # even free-text junk in the field carries no identifier out.
+        masked = masker.mask_result({"url": f"visited {ENDPOINT_IP} twice"})
+        assert ENDPOINT_IP not in masked["url"]
+        assert masked["url"].startswith("url-")
+
+    def test_percent_encoded_url_seals_whole_value(self, masker: OutputMasker):
+        # The live webfilter shape on both 7.6.7 and 8.0.0: the url field
+        # carries the whole URL percent-encoded (scheme as %3A%2F%2F), so
+        # nothing parses as a host and the free-text fallback cannot see
+        # the hostname behind the %2F boundary. Found by the flag-on live
+        # round; the whole raw value seals as one url token instead.
+        encoded = f"https%3A%2F%2F{BAD_DOMAIN}%2Fportal%2Flogin%3Fuser%3D{ANALYST}"
+        masked = masker.mask_result({"url": encoded, "hostname": BAD_DOMAIN})
+        assert BAD_DOMAIN not in masked["url"]
+        assert ANALYST not in masked["url"]
+        assert masked["url"].startswith("url-")
+        # the record keeps the masked-host correlation through the sibling
+        assert masked["hostname"].startswith("host-")
+
+    def test_schemeless_url_seals_whole(self, masker: OutputMasker):
+        # Classic FAZ webfilter shapes carry no scheme; urlsplit finds no
+        # host and the old fallback leaked the whole value raw (found by
+        # the post-open adversarial review).
+        for raw in (f"{BAD_DOMAIN}/login?user={ANALYST}", "/download/report-jdoe.pdf"):
+            masked = masker.mask_result({"url": raw})["url"]
+            assert masked.startswith("url-")
+            assert BAD_DOMAIN not in masked and "login" not in masked and "jdoe" not in masked
+
+    def test_control_chars_in_netloc_do_not_kill_the_result(self, masker: OutputMasker):
+        # urlsplit strips tab/CR/LF (bpo-43882) so the parsed netloc is not
+        # a substring of the raw value; the naive .index() raised and the
+        # whole multi-row result failed closed.
+        hostile = "http://exa\tmple.com/x"
+        masked = masker.mask_result({"url": hostile, "other": "keep"})
+        assert masked.get("other") == "keep"  # result survived
+        assert "example.com" not in str(masked["url"])
+
+    def test_single_letter_host_short_circuits(self, masker: OutputMasker):
+        # 'https://h': .index() from position 0 found the 'h' inside the
+        # scheme, mis-slicing the tail. The empty remainder must short
+        # circuit with no url- token.
+        masked = masker.mask_result({"url": "https://h"})["url"]
+        assert "url-" not in masked
+        assert masked.startswith("https://host-")
+
+    def test_list_valued_url_masks(self, masker: OutputMasker):
+        masked = masker.mask_result({"url": [f"https://{BAD_DOMAIN}/a/b"]})["url"]
+        assert isinstance(masked, list)
+        assert BAD_DOMAIN not in str(masked)
+
+    def test_percent_encoded_userinfo_fails_closed(self, masker: OutputMasker):
+        # Roland's decision: credentials never ride a reversible token.
+        # The percent-encoded live shape can smuggle userinfo past the
+        # netloc check; decode-and-inspect closes it.
+        encoded = f"https%3A%2F%2F{ANALYST}%3Asecret%40{BAD_DOMAIN}%2Fpath"
+        masked = masker.mask_result({"url": encoded})["url"]
+        assert masked.startswith("masked-unrepresentable-")
+        assert ANALYST not in masked and "secret" not in masked
